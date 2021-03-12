@@ -3,8 +3,10 @@ package mustgather
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
+	"k8s.io/apimachinery/pkg/types"
 	"math/rand"
 	"os"
 	"path"
@@ -17,6 +19,13 @@ import (
 	"github.com/spf13/cobra"
 	"k8s.io/klog/v2"
 
+	imagev1client "github.com/openshift/client-go/image/clientset/versioned/typed/image/v1"
+	"github.com/openshift/library-go/pkg/image/imageutil"
+	imagereference "github.com/openshift/library-go/pkg/image/reference"
+	"github.com/openshift/library-go/pkg/operator/resource/retry"
+	"github.com/openshift/oc/pkg/cli/admin/inspect"
+	"github.com/openshift/oc/pkg/cli/rsync"
+	authenticationv1 "k8s.io/api/authentication/v1"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
@@ -32,14 +41,6 @@ import (
 	"k8s.io/kubectl/pkg/polymorphichelpers"
 	"k8s.io/kubectl/pkg/scheme"
 	"k8s.io/kubectl/pkg/util/templates"
-
-	imagev1client "github.com/openshift/client-go/image/clientset/versioned/typed/image/v1"
-	"github.com/openshift/library-go/pkg/image/imageutil"
-	imagereference "github.com/openshift/library-go/pkg/image/reference"
-	"github.com/openshift/library-go/pkg/operator/resource/retry"
-
-	"github.com/openshift/oc/pkg/cli/admin/inspect"
-	"github.com/openshift/oc/pkg/cli/rsync"
 )
 
 var (
@@ -277,8 +278,62 @@ func (o *MustGatherOptions) Run() error {
 		}()
 	}
 
+	// ... service account ...
+	//use custom SA to not to rely on kube-controller-manager's default
+	serviceAccount, err := o.Client.CoreV1().ServiceAccounts(ns.Name).Create(context.TODO(),
+		&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{GenerateName: "openshift-must-gather-"}},
+		metav1.CreateOptions{})
+	if err != nil {
+		return err
+	}
+
+	// Build the secret
+	saSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			GenerateName:       serviceAccount.Name + "-token-",
+			Namespace: serviceAccount.Namespace,
+			Annotations: map[string]string{
+				corev1.ServiceAccountNameKey: serviceAccount.Name,
+				corev1.ServiceAccountUIDKey:  string(serviceAccount.UID),
+			},
+		},
+		Type: corev1.SecretTypeServiceAccountToken,
+		Data: map[string][]byte{},
+	}
+
+	tr := &authenticationv1.TokenRequest{
+		Spec: authenticationv1.TokenRequestSpec{
+		},
+	}
+	token, err := o.Client.CoreV1().ServiceAccounts(ns.Name).CreateToken(context.TODO(), serviceAccount.Name, tr, metav1.CreateOptions{})
+	if err != nil {
+		return err
+	}
+	saSecret.Data[corev1.ServiceAccountTokenKey] = []byte(token.Status.Token)
+	saSecret.Data[corev1.ServiceAccountNamespaceKey] = []byte(ns.Name)
+
+	// Save the secret
+	secret, err := o.Client.CoreV1().Secrets(serviceAccount.Namespace).Create(context.TODO(), saSecret, metav1.CreateOptions{})
+	if err != nil {
+		return err
+	}
+
+	serviceAccountPatchData, err := json.Marshal(corev1.ServiceAccount{
+		Secrets: []corev1.ObjectReference{
+			{
+				Kind: "Secrets",
+				Name: secret.Name,
+			},
+		},
+	})
+
+	// Patch the service account
+	if _, err := o.Client.CoreV1().ServiceAccounts(ns.Name).Patch(context.TODO(), serviceAccount.Name, types.StrategicMergePatchType, serviceAccountPatchData, metav1.PatchOptions{}); err != nil {
+		return err
+	}
+
 	// ... cluster role binding ...
-	clusterRoleBinding, err := o.Client.RbacV1().ClusterRoleBindings().Create(context.TODO(), o.newClusterRoleBinding(ns.Name), metav1.CreateOptions{})
+	clusterRoleBinding, err := o.Client.RbacV1().ClusterRoleBindings().Create(context.TODO(), o.newClusterRoleBinding(ns.Name, serviceAccount.Name), metav1.CreateOptions{})
 	if err != nil {
 		return err
 	}
@@ -302,7 +357,7 @@ func (o *MustGatherOptions) Run() error {
 			return err
 		}
 
-		pod, err := o.Client.CoreV1().Pods(ns.Name).Create(context.TODO(), o.newPod(o.NodeName, image), metav1.CreateOptions{})
+		pod, err := o.Client.CoreV1().Pods(ns.Name).Create(context.TODO(), o.newPod(o.NodeName, image, serviceAccount.Name), metav1.CreateOptions{})
 		if err != nil {
 			return err
 		}
@@ -532,7 +587,7 @@ func (o *MustGatherOptions) waitForGatherContainerRunning(pod *corev1.Pod) error
 	})
 }
 
-func (o *MustGatherOptions) newClusterRoleBinding(ns string) *rbacv1.ClusterRoleBinding {
+func (o *MustGatherOptions) newClusterRoleBinding(ns, sa string) *rbacv1.ClusterRoleBinding {
 	return &rbacv1.ClusterRoleBinding{
 		ObjectMeta: metav1.ObjectMeta{
 			GenerateName: "must-gather-",
@@ -548,7 +603,7 @@ func (o *MustGatherOptions) newClusterRoleBinding(ns string) *rbacv1.ClusterRole
 		Subjects: []rbacv1.Subject{
 			{
 				Kind:      "ServiceAccount",
-				Name:      "default",
+				Name:      sa,
 				Namespace: ns,
 			},
 		},
@@ -558,7 +613,7 @@ func (o *MustGatherOptions) newClusterRoleBinding(ns string) *rbacv1.ClusterRole
 // newPod creates a pod with 2 containers with a shared volume mount:
 // - gather: init containers that run gather command
 // - copy: no-op container we can exec into
-func (o *MustGatherOptions) newPod(node, image string) *corev1.Pod {
+func (o *MustGatherOptions) newPod(node, image, sa string) *corev1.Pod {
 	zero := int64(0)
 
 	nodeSelector := map[string]string{
@@ -578,6 +633,7 @@ func (o *MustGatherOptions) newPod(node, image string) *corev1.Pod {
 		Spec: corev1.PodSpec{
 			NodeName:      node,
 			RestartPolicy: corev1.RestartPolicyNever,
+			ServiceAccountName: sa,
 			Volumes: []corev1.Volume{
 				{
 					Name: "must-gather-output",
